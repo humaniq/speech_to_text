@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+package audio;
+
+service Audio {
+    rpc SpeechToText (Request) returns (Response);
+}
+
+message Request {
+    bytes audio = 1;
+    string lang_code = 2;
+}
+
+message Response {
+    repeated string transcriptions = 1;
+}
