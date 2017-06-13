@@ -1,10 +1,9 @@
 package main
 
 import (
-	"os"
 	"fmt"
 	"log"
-	"io/ioutil"
+	"os"
 
 	"github.com/humaniq/speech_to_text/audio"
 
@@ -12,17 +11,15 @@ import (
 	"google.golang.org/grpc"
 )
 
-var path string
+var fileUrl string
 
 func main() {
 	args := os.Args
 	if len(args) > 1 {
-		path = args[1]
+		fileUrl = args[1]
 	} else {
-		log.Fatal("You must pass a path to audio file")
+		log.Fatal("You must pass a URL of audio file")
 	}
-
-	data, _ := ioutil.ReadFile(path)
 
 	// Set up a connection to the server.
 	conn, err := grpc.Dial("localhost:50051", grpc.WithInsecure())
@@ -32,7 +29,7 @@ func main() {
 	defer conn.Close()
 
 	c := audio.NewAudioClient(conn)
-	r, err := c.SpeechToText(context.Background(), &audio.Request{LangCode: "en-US", Audio: data})
+	r, err := c.SpeechToText(context.Background(), &audio.Request{LangCode: "en-US", FileUrl: fileUrl})
 	if err != nil {
 		log.Fatal(err.Error())
 	}

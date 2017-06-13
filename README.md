@@ -38,4 +38,7 @@ $ go run client/main.go audio.raw
 
 ## Environment variables
 
-- `GOOGLE_CREDENTIALS` - Path to json file with credentials.
+* `GOOGLE_CREDENTIALS` - path to json file with credentials;
+* `GOOGLE_STORAGE_BUCKET` - name of GCS bucket (default: `humaniq-speech`);
+* `TRANSCODE_SERVICE_URL` - URL of Transcode service (default: `localhost:50052`);
+* `APP_ENV` – application environment.

@@ -7,7 +7,7 @@ service Audio {
 }
 
 message Request {
-    bytes audio = 1;
+    string file_url = 1;
     string lang_code = 2;
 }
 
