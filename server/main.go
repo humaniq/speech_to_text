@@ -1,10 +1,12 @@
 package main
 
 import (
-	"os"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net"
+	"net/http"
+	"os"
 
 	// Imports the Google Cloud Speech API client package.
 	"golang.org/x/net/context"
@@ -14,19 +16,33 @@ import (
 	speech "cloud.google.com/go/speech/apiv1"
 	speechpb "google.golang.org/genproto/googleapis/cloud/speech/v1"
 
-	"google.golang.org/grpc"
 	"google.golang.org/api/option"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
+
+	"github.com/humaniq/hmnqlog"
+)
+
+const (
+	app_name    string = "speech_to_text"
+	app_version string = "0.1.0"
 )
 
 var (
 	speech_client *speech.Client
+	hlog          hmnqlog.Logger
 )
 
-type server struct {}
+type server struct{}
 
 func (s *server) SpeechToText(ctx context.Context, in *audio.Request) (*audio.Response, error) {
-	log.Println(fmt.Sprintf("Speech to text request received, language code: '%s'", in.LangCode))
+	hlog.Info(fmt.Sprintf("Speech to text request received, file URL: '%s', language code: '%s'", in.FileUrl, in.LangCode))
+
+	audioFileContent, err := downloadAudioFile(in.FileUrl)
+	if err != nil {
+		hlog.Warn(err.Error())
+		return nil, err
+	}
 
 	// Detects speech in the audio file.
 	resp, err := speech_client.Recognize(ctx, &speechpb.RecognizeRequest{
@@ -36,11 +52,12 @@ func (s *server) SpeechToText(ctx context.Context, in *audio.Request) (*audio.Re
 			LanguageCode:    in.LangCode,
 		},
 		Audio: &speechpb.RecognitionAudio{
-			AudioSource: &speechpb.RecognitionAudio_Content{Content: in.Audio},
+			AudioSource: &speechpb.RecognitionAudio_Content{Content: audioFileContent},
 		},
 	})
 	if err != nil {
-		log.Println(err.Error())
+		hlog.Warn(err.Error())
+		return nil, err
 	}
 
 	var transcriptions []string
@@ -53,22 +70,43 @@ func (s *server) SpeechToText(ctx context.Context, in *audio.Request) (*audio.Re
 	return &audio.Response{Transcriptions: transcriptions}, nil
 }
 
+func downloadAudioFile(fileUrl string) ([]byte, error) {
+	response, err := http.Get(fileUrl)
+	if err != nil {
+		return []byte{}, err
+	}
+
+	defer response.Body.Close()
+
+	return ioutil.ReadAll(response.Body)
+}
+
 func main() {
 	ctx := context.Background()
 
-	// Creates a client.
 	var err error
+
+	hlog, err = hmnqlog.NewZapLogger(hmnqlog.ZapOptions{
+		AppName:     app_name,
+		AppEnv:      os.Getenv("APP_ENV"),
+		AppRevision: app_version,
+	})
+	if err != nil {
+		log.Fatal(fmt.Sprintf("Failed to load logger, error %s", err.Error()))
+	}
+
+	// Creates a client.
 	speech_client, err = speech.NewClient(ctx, option.WithServiceAccountFile(os.Getenv("GOOGLE_CREDENTIALS")))
 	if err != nil {
-		log.Fatalf("Failed to create client: %v", err)
+		hlog.Fatal(fmt.Sprintf("Failed to create client: %v", err))
 	}
 
 	lis, err := net.Listen("tcp", ":50051")
 	if err != nil {
-		log.Fatal(err.Error())
+		hlog.Fatal(err.Error())
 	}
 
-	log.Println(fmt.Sprintf("Server started at port: %s", "50051"))
+	hlog.Info(fmt.Sprintf("Server started at port: %s", "50051"))
 
 	s := grpc.NewServer()
 	audio.RegisterAudioServer(s, &server{})
@@ -76,6 +114,6 @@ func main() {
 	// Register reflection service on gRPC server.
 	reflection.Register(s)
 	if err := s.Serve(lis); err != nil {
-		log.Fatal(err.Error())
+		hlog.Fatal(err.Error())
 	}
 }

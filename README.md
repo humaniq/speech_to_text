@@ -38,4 +38,5 @@ $ go run client/main.go audio.raw
 
 ## Environment variables
 
-- `GOOGLE_CREDENTIALS` - Path to json file with credentials.
+- `GOOGLE_CREDENTIALS` - Path to json file with credentials;
+- `APP_ENV` – Application environment.
