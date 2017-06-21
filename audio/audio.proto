@@ -12,5 +12,5 @@ message Request {
 }
 
 message Response {
-    repeated string transcriptions = 1;
+    string file_url = 1;
 }

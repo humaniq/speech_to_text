@@ -6,38 +6,38 @@ import (
 	"io/ioutil"
 	"log"
 	"net"
-	"net/http"
 	"os"
 	"time"
 
 	"cloud.google.com/go/storage"
 	"golang.org/x/net/context"
 
-	speech "cloud.google.com/go/speech/apiv1"
-	speechpb "google.golang.org/genproto/googleapis/cloud/speech/v1"
-
-	"google.golang.org/api/option"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
 
-	"github.com/humaniq/grpc_proto/transcode"
 	"github.com/humaniq/hmnqlog"
 	"github.com/humaniq/speech_to_text/audio"
+	"github.com/humaniq/speech_to_text/utils"
 
 	"github.com/satori/go.uuid"
+	"github.com/streadway/amqp"
 )
 
 const (
-	app_name                   string = "speech_to_text"
-	app_version                string = "0.1.0"
+	appName                    string = "speech_to_text"
+	appVersion                 string = "0.1.0"
+	defaultAppPort             string = "50052"
+	defaultExchangeName        string = "humaniq-speech_to_text-exchange"
+	defaultQueueName           string = "speech_to_text_worker"
+	defaultRabbitMQURL         string = "amqp://guest:guest@localhost:5672/"
 	defaultGoogleStorageBucket string = "humaniq-speech"
-	defaultTranscodeServiceUrl string = "localhost:50052"
 )
 
 var (
-	speech_client     *speech.Client
-	hlog              hmnqlog.Logger
-	googleCredentials map[string]interface{}
+	hlog                hmnqlog.Logger
+	googleCredentials   map[string]interface{}
+	messageQueueChannel *amqp.Channel
+	requiredEnvVars     = []string{"GOOGLE_CREDENTIALS", "APP_ENV"}
 )
 
 type server struct{}
@@ -45,70 +45,32 @@ type server struct{}
 func (s *server) SpeechToText(ctx context.Context, in *audio.Request) (*audio.Response, error) {
 	hlog.Info(fmt.Sprintf("Speech to text request received, file URL: '%s', language code: '%s'", in.FileUrl, in.LangCode))
 
-	transcodedAudioFileUrl, err := transcodeAudioFile(in.FileUrl)
+	audioFileName := fmt.Sprintf("media/audio/%s", uuid.NewV4())
+	uploadAudioFileUrl, err := buildSignedURL(audioFileName, "PUT")
 	if err != nil {
-		hlog.Warn(fmt.Sprintf("Error transcoding audio file: %s", err))
+		return nil, err
+	}
+	downloadAudioFileUrl, err := buildSignedURL(audioFileName, "GET")
+	if err != nil {
 		return nil, err
 	}
 
-	audioFileContent, err := downloadAudioFile(transcodedAudioFileUrl)
+	resultFileName := fmt.Sprintf("data/text/%s", uuid.NewV4())
+	uploadResultFileUrl, err := buildSignedURL(resultFileName, "PUT")
 	if err != nil {
-		hlog.Warn(fmt.Sprintf("Error downloading audio file: %s", err))
+		return nil, err
+	}
+	downloadResultFileUrl, err := buildSignedURL(resultFileName, "GET")
+	if err != nil {
 		return nil, err
 	}
 
-	// Detects speech in the audio file.
-	resp, err := speech_client.Recognize(ctx, &speechpb.RecognizeRequest{
-		Config: &speechpb.RecognitionConfig{
-			Encoding:        speechpb.RecognitionConfig_FLAC,
-			SampleRateHertz: 16000,
-			LanguageCode:    in.LangCode,
-		},
-		Audio: &speechpb.RecognitionAudio{
-			AudioSource: &speechpb.RecognitionAudio_Content{Content: audioFileContent},
-		},
-	})
+	err = createSpeechToTextTask(in.FileUrl, in.LangCode, uploadAudioFileUrl, downloadAudioFileUrl, uploadResultFileUrl)
 	if err != nil {
-		hlog.Warn(fmt.Sprintf("Error recognizing audio file: %s", err))
 		return nil, err
 	}
 
-	var transcriptions []string
-	for _, result := range resp.Results {
-		for _, alt := range result.Alternatives {
-			transcriptions = append(transcriptions, alt.Transcript)
-		}
-	}
-
-	return &audio.Response{Transcriptions: transcriptions}, nil
-}
-
-func transcodeAudioFile(fileUrl string) (string, error) {
-	conn, err := grpc.Dial(transcodeServiceUrl(), grpc.WithInsecure())
-	if err != nil {
-		return "", err
-	}
-	defer conn.Close()
-
-	filename := fmt.Sprintf("media/audio/%s", uuid.NewV4())
-
-	destinationFileUrl, err := buildSignedURL(filename, "PUT")
-	if err != nil {
-		return "", err
-	}
-	transcodeRequest := &transcode.Request{SourceFileUrl: fileUrl, DestinationFileUrl: destinationFileUrl}
-	transcodeClient := transcode.NewTranscodeClient(conn)
-
-	_, err = transcodeClient.AudioToFlac(context.Background(), transcodeRequest)
-	if err != nil {
-		return "", err
-	}
-
-	resultFileUrl, err := buildSignedURL(filename, "GET")
-	if err != nil {
-		return "", err
-	}
-	return resultFileUrl, nil
+	return &audio.Response{FileUrl: downloadResultFileUrl}, nil
 }
 
 func buildSignedURL(filename, method string) (string, error) {
@@ -125,42 +87,46 @@ func buildSignedURL(filename, method string) (string, error) {
 	return url, nil
 }
 
-func downloadAudioFile(fileUrl string) ([]byte, error) {
-	response, err := http.Get(fileUrl)
+func createSpeechToTextTask(sourceFileUrl, langCode, uploadAudioFileUrl, downloadAudioFileUrl, uploadResultFileUrl string) error {
+	message := map[string]string{
+		"source_file_url":         sourceFileUrl,
+		"lang_code":               langCode,
+		"upload_audio_file_url":   uploadAudioFileUrl,
+		"download_audio_file_url": downloadAudioFileUrl,
+		"upload_result_file_url":  uploadResultFileUrl,
+	}
+
+	body, err := json.Marshal(message)
 	if err != nil {
-		return []byte{}, err
+		return err
 	}
 
-	defer response.Body.Close()
+	err = messageQueueChannel.Publish(
+		exchangeName(), // exchange
+		queueName(),    // routing key
+		false,          // mandatory
+		false,          // immediate
+		amqp.Publishing{
+			ContentType: "application/json",
+			Body:        body,
+		})
 
-	return ioutil.ReadAll(response.Body)
-}
-
-func googleStorageBucket() string {
-	bucket := os.Getenv("GOOGLE_STORAGE_BUCKET")
-	if bucket == "" {
-		bucket = defaultGoogleStorageBucket
+	if err != nil {
+		return err
 	}
-	return bucket
-}
-
-func transcodeServiceUrl() string {
-	serviceUrl := os.Getenv("TRANSCODE_SERVICE_URL")
-	if serviceUrl == "" {
-		serviceUrl = defaultTranscodeServiceUrl
-	}
-	return serviceUrl
+	return nil
 }
 
 func main() {
-	ctx := context.Background()
-
-	var err error
+	err := utils.CheckRequiredEnvVars(requiredEnvVars)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	hlog, err = hmnqlog.NewZapLogger(hmnqlog.ZapOptions{
-		AppName:     app_name,
+		AppName:     appName,
 		AppEnv:      os.Getenv("APP_ENV"),
-		AppRevision: app_version,
+		AppRevision: appVersion,
 	})
 	if err != nil {
 		log.Fatal(fmt.Sprintf("Failed to load logger, error %s", err.Error()))
@@ -171,23 +137,21 @@ func main() {
 		hlog.Fatal(fmt.Sprintf("Failed to load google credentials: %v", err))
 	}
 
-	// Creates a client.
-	speech_client, err = speech.NewClient(ctx, option.WithServiceAccountFile(os.Getenv("GOOGLE_CREDENTIALS")))
-	if err != nil {
-		hlog.Fatal(fmt.Sprintf("Failed to create client: %v", err))
-	}
+	var messageQueueConnection *amqp.Connection
+	messageQueueConnection, messageQueueChannel = setupMessageQueueConnection()
+	defer messageQueueConnection.Close()
+	defer messageQueueChannel.Close()
 
-	lis, err := net.Listen("tcp", ":50051")
+	lis, err := net.Listen("tcp", ":"+appPort())
 	if err != nil {
 		hlog.Fatal(err.Error())
 	}
 
-	hlog.Info(fmt.Sprintf("Server started at port: %s", "50051"))
+	hlog.Info(fmt.Sprintf("Server started at port: %s", appPort()))
 
 	s := grpc.NewServer()
 	audio.RegisterAudioServer(s, &server{})
 
-	// Register reflection service on gRPC server.
 	reflection.Register(s)
 	if err := s.Serve(lis); err != nil {
 		hlog.Fatal(err.Error())
@@ -206,4 +170,38 @@ func loadGoogleCredentials(credentials *map[string]interface{}) error {
 	}
 
 	return nil
+}
+
+func setupMessageQueueConnection() (*amqp.Connection, *amqp.Channel) {
+	conn, err := amqp.Dial(rabbitmqUrl())
+	failOnError(err, "Failed to connect to RabbitMQ")
+
+	ch, err := conn.Channel()
+	failOnError(err, "Failed to open a channel")
+
+	err = utils.DeclareExchange(ch, exchangeName())
+	failOnError(err, "Failed to declare an exchange")
+	return conn, ch
+}
+
+func appPort() string {
+	return utils.FromEnvWithDefault("APP_PORT", defaultAppPort)
+}
+func rabbitmqUrl() string {
+	return utils.FromEnvWithDefault("RABBITMQ_URL", defaultRabbitMQURL)
+}
+func exchangeName() string {
+	return utils.FromEnvWithDefault("EXCHANGE_NAME", defaultExchangeName)
+}
+func queueName() string {
+	return utils.FromEnvWithDefault("QUEUE_NAME", defaultQueueName)
+}
+func googleStorageBucket() string {
+	return utils.FromEnvWithDefault("GOOGLE_STORAGE_BUCKET", defaultGoogleStorageBucket)
+}
+
+func failOnError(err error, msg string) {
+	if err != nil {
+		hlog.Fatal(fmt.Sprintf("%s: %s", msg, err))
+	}
 }
